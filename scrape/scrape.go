@@ -62,6 +62,15 @@ var AlignScrapeTimestamps = true
 
 var errNameLabelMandatory = fmt.Errorf("missing metric name (%s label)", labels.MetricName)
 
+var _ FailureLogger = (*logging.JSONFileLogger)(nil)
+
+// FailureLogger is an interface that can be used to log all failed
+// scrapes.
+type FailureLogger interface {
+	slog.Handler
+	io.Closer
+}
+
 // scrapePool manages scrapes for sets of targets.
 type scrapePool struct {
 	appendable storage.Appendable
@@ -91,7 +100,7 @@ type scrapePool struct {
 
 	metrics *scrapeMetrics
 
-	scrapeFailureLogger    *logging.JSONFileLogger
+	scrapeFailureLogger    FailureLogger
 	scrapeFailureLoggerMtx sync.RWMutex
 }
 
@@ -224,11 +233,11 @@ func (sp *scrapePool) DroppedTargetsCount() int {
 	return sp.droppedTargetsCount
 }
 
-func (sp *scrapePool) SetScrapeFailureLogger(l *logging.JSONFileLogger) {
+func (sp *scrapePool) SetScrapeFailureLogger(l FailureLogger) {
 	sp.scrapeFailureLoggerMtx.Lock()
 	defer sp.scrapeFailureLoggerMtx.Unlock()
 	if l != nil {
-		l.With("job_name", sp.config.JobName)
+		l = slog.New(l).With("job_name", sp.config.JobName).Handler().(FailureLogger)
 	}
 	sp.scrapeFailureLogger = l
 
@@ -239,7 +248,7 @@ func (sp *scrapePool) SetScrapeFailureLogger(l *logging.JSONFileLogger) {
 	}
 }
 
-func (sp *scrapePool) getScrapeFailureLogger() *logging.JSONFileLogger {
+func (sp *scrapePool) getScrapeFailureLogger() FailureLogger {
 	sp.scrapeFailureLoggerMtx.RLock()
 	defer sp.scrapeFailureLoggerMtx.RUnlock()
 	return sp.scrapeFailureLogger
@@ -792,7 +801,7 @@ func acceptEncodingHeader(enableCompression bool) string {
 	return "identity"
 }
 
-var UserAgent = fmt.Sprintf("Prometheus/%s", version.Version)
+var UserAgent = version.PrometheusUserAgent()
 
 func (s *targetScraper) scrape(ctx context.Context) (*http.Response, error) {
 	if s.req == nil {
@@ -866,7 +875,7 @@ func (s *targetScraper) readResponse(ctx context.Context, resp *http.Response, w
 type loop interface {
 	run(errc chan<- error)
 	setForcedError(err error)
-	setScrapeFailureLogger(*logging.JSONFileLogger)
+	setScrapeFailureLogger(FailureLogger)
 	stop()
 	getCache() *scrapeCache
 	disableEndOfRunStalenessMarkers()
@@ -882,7 +891,7 @@ type cacheEntry struct {
 type scrapeLoop struct {
 	scraper                  scraper
 	l                        *slog.Logger
-	scrapeFailureLogger      *logging.JSONFileLogger
+	scrapeFailureLogger      FailureLogger
 	scrapeFailureLoggerMtx   sync.RWMutex
 	cache                    *scrapeCache
 	lastScrapeSize           int
@@ -1282,11 +1291,11 @@ func newScrapeLoop(ctx context.Context,
 	return sl
 }
 
-func (sl *scrapeLoop) setScrapeFailureLogger(l *logging.JSONFileLogger) {
+func (sl *scrapeLoop) setScrapeFailureLogger(l FailureLogger) {
 	sl.scrapeFailureLoggerMtx.Lock()
 	defer sl.scrapeFailureLoggerMtx.Unlock()
 	if ts, ok := sl.scraper.(fmt.Stringer); ok && l != nil {
-		l.With("target", ts.String())
+		l = slog.New(l).With("target", ts.String()).Handler().(FailureLogger)
 	}
 	sl.scrapeFailureLogger = l
 }
@@ -1436,7 +1445,7 @@ func (sl *scrapeLoop) scrapeAndReport(last, appendTime time.Time, errc chan<- er
 		sl.l.Debug("Scrape failed", "err", scrapeErr)
 		sl.scrapeFailureLoggerMtx.RLock()
 		if sl.scrapeFailureLogger != nil {
-			sl.scrapeFailureLogger.Log(context.Background(), slog.LevelError, scrapeErr.Error())
+			slog.New(sl.scrapeFailureLogger).Error(scrapeErr.Error())
 		}
 		sl.scrapeFailureLoggerMtx.RUnlock()
 		if errc != nil {
@@ -1705,7 +1714,7 @@ loop:
 			lset = ce.lset
 			hash = ce.hash
 		} else {
-			p.Metric(&lset)
+			p.Labels(&lset)
 			hash = lset.Hash()
 
 			// Hash label set as it is seen local to the target. Then add target labels
@@ -1953,12 +1962,24 @@ func isSeriesPartOfFamily(mName string, mfName []byte, typ model.MetricType) boo
 
 // Adds samples to the appender, checking the error, and then returns the # of samples added,
 // whether the caller should continue to process more samples, and any sample or bucket limit errors.
+// Switch error cases for Sample and Bucket limits are checked first since they're more common
+// during normal operation (e.g., accidental cardinality explosion, sudden traffic spikes).
+// Current case ordering prevents exercising other cases when limits are exceeded.
+// Remaining error cases typically occur only a few times, often during initial setup.
 func (sl *scrapeLoop) checkAddError(met []byte, err error, sampleLimitErr, bucketLimitErr *error, appErrs *appendErrors) (bool, error) {
 	switch {
 	case err == nil:
 		return true, nil
-	case errors.Is(err, storage.ErrNotFound):
-		return false, storage.ErrNotFound
+	case errors.Is(err, errSampleLimit):
+		// Keep on parsing output if we hit the limit, so we report the correct
+		// total number of samples scraped.
+		*sampleLimitErr = err
+		return false, nil
+	case errors.Is(err, errBucketLimit):
+		// Keep on parsing output if we hit the limit, so we report the bucket
+		// total number of samples scraped.
+		*bucketLimitErr = err
+		return false, nil
 	case errors.Is(err, storage.ErrOutOfOrderSample):
 		appErrs.numOutOfOrder++
 		sl.l.Debug("Out of order sample", "series", string(met))
@@ -1974,32 +1995,87 @@ func (sl *scrapeLoop) checkAddError(met []byte, err error, sampleLimitErr, bucke
 		sl.l.Debug("Out of bounds metric", "series", string(met))
 		sl.metrics.targetScrapeSampleOutOfBounds.Inc()
 		return false, nil
-	case errors.Is(err, errSampleLimit):
-		// Keep on parsing output if we hit the limit, so we report the correct
-		// total number of samples scraped.
-		*sampleLimitErr = err
-		return false, nil
-	case errors.Is(err, errBucketLimit):
-		// Keep on parsing output if we hit the limit, so we report the correct
-		// total number of samples scraped.
-		*bucketLimitErr = err
-		return false, nil
+	case errors.Is(err, storage.ErrNotFound):
+		return false, storage.ErrNotFound
 	default:
 		return false, err
 	}
 }
 
+// reportSample represents automatically generated timeseries documented in
+// https://prometheus.io/docs/concepts/jobs_instances/#automatically-generated-labels-and-time-series
+type reportSample struct {
+	metadata.Metadata
+	name []byte
+}
+
 // The constants are suffixed with the invalid \xff unicode rune to avoid collisions
 // with scraped metrics in the cache.
 var (
-	scrapeHealthMetricName        = []byte("up" + "\xff")
-	scrapeDurationMetricName      = []byte("scrape_duration_seconds" + "\xff")
-	scrapeSamplesMetricName       = []byte("scrape_samples_scraped" + "\xff")
-	samplesPostRelabelMetricName  = []byte("scrape_samples_post_metric_relabeling" + "\xff")
-	scrapeSeriesAddedMetricName   = []byte("scrape_series_added" + "\xff")
-	scrapeTimeoutMetricName       = []byte("scrape_timeout_seconds" + "\xff")
-	scrapeSampleLimitMetricName   = []byte("scrape_sample_limit" + "\xff")
-	scrapeBodySizeBytesMetricName = []byte("scrape_body_size_bytes" + "\xff")
+	scrapeHealthMetric = reportSample{
+		name: []byte("up" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "Health of the scrape target. 1 means the target is healthy, 0 if the scrape failed.",
+			Unit: "targets",
+		},
+	}
+	scrapeDurationMetric = reportSample{
+		name: []byte("scrape_duration_seconds" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "Duration of the last scrape in seconds.",
+			Unit: "seconds",
+		},
+	}
+	scrapeSamplesMetric = reportSample{
+		name: []byte("scrape_samples_scraped" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "Number of samples last scraped.",
+			Unit: "samples",
+		},
+	}
+	samplesPostRelabelMetric = reportSample{
+		name: []byte("scrape_samples_post_metric_relabeling" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "Number of samples remaining after metric relabeling was applied.",
+			Unit: "samples",
+		},
+	}
+	scrapeSeriesAddedMetric = reportSample{
+		name: []byte("scrape_series_added" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "Number of series in the last scrape.",
+			Unit: "series",
+		},
+	}
+	scrapeTimeoutMetric = reportSample{
+		name: []byte("scrape_timeout_seconds" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "The configured scrape timeout for a target.",
+			Unit: "seconds",
+		},
+	}
+	scrapeSampleLimitMetric = reportSample{
+		name: []byte("scrape_sample_limit" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "The configured sample limit for a target. Returns zero if there is no limit configured.",
+			Unit: "samples",
+		},
+	}
+	scrapeBodySizeBytesMetric = reportSample{
+		name: []byte("scrape_body_size_bytes" + "\xff"),
+		Metadata: metadata.Metadata{
+			Type: model.MetricTypeGauge,
+			Help: "The uncompressed size of the last scrape response, if successful. Scrapes failing because body_size_limit is exceeded report -1, other scrape failures report 0.",
+			Unit: "bytes",
+		},
+	}
 )
 
 func (sl *scrapeLoop) report(app storage.Appender, start time.Time, duration time.Duration, scraped, added, seriesAdded, bytes int, scrapeErr error) (err error) {
@@ -2013,29 +2089,29 @@ func (sl *scrapeLoop) report(app storage.Appender, start time.Time, duration tim
 	}
 	b := labels.NewBuilderWithSymbolTable(sl.symbolTable)
 
-	if err = sl.addReportSample(app, scrapeHealthMetricName, ts, health, b); err != nil {
+	if err = sl.addReportSample(app, scrapeHealthMetric, ts, health, b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, scrapeDurationMetricName, ts, duration.Seconds(), b); err != nil {
+	if err = sl.addReportSample(app, scrapeDurationMetric, ts, duration.Seconds(), b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, scrapeSamplesMetricName, ts, float64(scraped), b); err != nil {
+	if err = sl.addReportSample(app, scrapeSamplesMetric, ts, float64(scraped), b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, samplesPostRelabelMetricName, ts, float64(added), b); err != nil {
+	if err = sl.addReportSample(app, samplesPostRelabelMetric, ts, float64(added), b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, scrapeSeriesAddedMetricName, ts, float64(seriesAdded), b); err != nil {
+	if err = sl.addReportSample(app, scrapeSeriesAddedMetric, ts, float64(seriesAdded), b); err != nil {
 		return
 	}
 	if sl.reportExtraMetrics {
-		if err = sl.addReportSample(app, scrapeTimeoutMetricName, ts, sl.timeout.Seconds(), b); err != nil {
+		if err = sl.addReportSample(app, scrapeTimeoutMetric, ts, sl.timeout.Seconds(), b); err != nil {
 			return
 		}
-		if err = sl.addReportSample(app, scrapeSampleLimitMetricName, ts, float64(sl.sampleLimit), b); err != nil {
+		if err = sl.addReportSample(app, scrapeSampleLimitMetric, ts, float64(sl.sampleLimit), b); err != nil {
 			return
 		}
-		if err = sl.addReportSample(app, scrapeBodySizeBytesMetricName, ts, float64(bytes), b); err != nil {
+		if err = sl.addReportSample(app, scrapeBodySizeBytesMetric, ts, float64(bytes), b); err != nil {
 			return
 		}
 	}
@@ -2048,37 +2124,37 @@ func (sl *scrapeLoop) reportStale(app storage.Appender, start time.Time) (err er
 	stale := math.Float64frombits(value.StaleNaN)
 	b := labels.NewBuilder(labels.EmptyLabels())
 
-	if err = sl.addReportSample(app, scrapeHealthMetricName, ts, stale, b); err != nil {
+	if err = sl.addReportSample(app, scrapeHealthMetric, ts, stale, b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, scrapeDurationMetricName, ts, stale, b); err != nil {
+	if err = sl.addReportSample(app, scrapeDurationMetric, ts, stale, b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, scrapeSamplesMetricName, ts, stale, b); err != nil {
+	if err = sl.addReportSample(app, scrapeSamplesMetric, ts, stale, b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, samplesPostRelabelMetricName, ts, stale, b); err != nil {
+	if err = sl.addReportSample(app, samplesPostRelabelMetric, ts, stale, b); err != nil {
 		return
 	}
-	if err = sl.addReportSample(app, scrapeSeriesAddedMetricName, ts, stale, b); err != nil {
+	if err = sl.addReportSample(app, scrapeSeriesAddedMetric, ts, stale, b); err != nil {
 		return
 	}
 	if sl.reportExtraMetrics {
-		if err = sl.addReportSample(app, scrapeTimeoutMetricName, ts, stale, b); err != nil {
+		if err = sl.addReportSample(app, scrapeTimeoutMetric, ts, stale, b); err != nil {
 			return
 		}
-		if err = sl.addReportSample(app, scrapeSampleLimitMetricName, ts, stale, b); err != nil {
+		if err = sl.addReportSample(app, scrapeSampleLimitMetric, ts, stale, b); err != nil {
 			return
 		}
-		if err = sl.addReportSample(app, scrapeBodySizeBytesMetricName, ts, stale, b); err != nil {
+		if err = sl.addReportSample(app, scrapeBodySizeBytesMetric, ts, stale, b); err != nil {
 			return
 		}
 	}
 	return
 }
 
-func (sl *scrapeLoop) addReportSample(app storage.Appender, s []byte, t int64, v float64, b *labels.Builder) error {
-	ce, ok, _ := sl.cache.get(s)
+func (sl *scrapeLoop) addReportSample(app storage.Appender, s reportSample, t int64, v float64, b *labels.Builder) error {
+	ce, ok, _ := sl.cache.get(s.name)
 	var ref storage.SeriesRef
 	var lset labels.Labels
 	if ok {
@@ -2089,7 +2165,7 @@ func (sl *scrapeLoop) addReportSample(app storage.Appender, s []byte, t int64, v
 		// with scraped metrics in the cache.
 		// We have to drop it when building the actual metric.
 		b.Reset(labels.EmptyLabels())
-		b.Set(labels.MetricName, string(s[:len(s)-1]))
+		b.Set(labels.MetricName, string(s.name[:len(s.name)-1]))
 		lset = sl.reportSampleMutator(b.Labels())
 	}
 
@@ -2097,7 +2173,13 @@ func (sl *scrapeLoop) addReportSample(app storage.Appender, s []byte, t int64, v
 	switch {
 	case err == nil:
 		if !ok {
-			sl.cache.addRef(s, ref, lset, lset.Hash())
+			sl.cache.addRef(s.name, ref, lset, lset.Hash())
+			// We only need to add metadata once a scrape target appears.
+			if sl.appendMetadataToWAL {
+				if _, merr := app.UpdateMetadata(ref, lset, s.Metadata); merr != nil {
+					sl.l.Debug("Error when appending metadata in addReportSample", "ref", fmt.Sprintf("%d", ref), "metadata", fmt.Sprintf("%+v", s.Metadata), "err", merr)
+				}
+			}
 		}
 		return nil
 	case errors.Is(err, storage.ErrOutOfOrderSample), errors.Is(err, storage.ErrDuplicateSampleForTimestamp):
